@@ -1,0 +1,124 @@
+#!/bin/bash
+set -e
+
+echo "=== Автоматический установщик Gentoo для /dev/sdb ==="
+
+read -sp "Введите будущий пароль для пользователя root: " ROOT_PASSWORD
+echo ""
+if [ -z "$ROOT_PASSWORD" ]; then
+    echo "Ошибка: Пароль не может быть пустым!"
+    exit 1
+fi
+
+DISK="/dev/sdb"
+STAGE3_URL="https://gentoo.osuosl.org/releases/amd64/autobuilds/current-stage3-amd64-openrc/"
+STAGE3_FILE=$(curl -s "$STAGE3_URL" | grep -oE 'stage3-amd64-openrc-[0-9TZ]+.tar.xz' | head -n 1)
+
+if [ -z "$STAGE3_FILE" ]; then
+    echo "Не удалось автоматически найти Stage3 tarball. Проверьте интернет."
+    exit 1
+fi
+
+echo "Разметка диска $DISK..."
+dd if=/dev/zero of=$DISK bs=1M count=10 conv=notrunc
+parted -s $DISK mklabel gpt
+parted -s $DISK mkpart primary fat32 1MiB 1025MiB
+parted -s $DISK set 1 esp on
+parted -s $DISK mkpart primary linux-swap 1025MiB 103425MiB
+parted -s $DISK mkpart primary ext4 103425MiB 100%
+
+PART_BOOT="${DISK}1"
+PART_SWAP="${DISK}2"
+PART_ROOT="${DISK}3"
+
+echo "Форматирование разделов..."
+mkfs.vfat -F 32 "$PART_BOOT"
+mkswap "$PART_SWAP"
+swapon "$PART_SWAP"
+mkfs.ext4 -F "$PART_ROOT"
+
+mkdir -p /mnt/gentoo
+mount "$PART_ROOT" /mnt/gentoo
+mkdir -p /mnt/gentoo/efi
+mount "$PART_BOOT" /mnt/gentoo/efi
+
+cd /mnt/gentoo
+wget -q "${STAGE3_URL}${STAGE3_FILE}"
+tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
+rm stage3-*.tar.xz
+
+cat << MAKE_CONF > /mnt/gentoo/etc/portage/make.conf
+COMMON_FLAGS="-O2 -pipe -march=native"
+CFLAGS="\${COMMON_FLAGS}"
+CXXFLAGS="\${COMMON_FLAGS}"
+FCFLAGS="\${COMMON_FLAGS}"
+FFLAGS="\${COMMON_FLAGS}"
+MAKEOPTS="-j\$(nproc)"
+PORTAGE_NICENESS=19
+EMERGE_DEFAULT_OPTS="--jobs=\$(nproc) --load-average=\$(nproc)"
+ACCEPT_LICENSE="*"
+GRUB_PLATFORMS="efi-64"
+USE="elogind unicode nls -systemd"
+MAKE_CONF
+
+mkdir --parents /mnt/gentoo/etc/portage/repos.conf
+cp /mnt/gentoo/usr/share/portage/config/repos.conf /mnt/gentoo/etc/portage/repos.conf/gentoo.conf
+
+cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
+mount --types proc /proc /mnt/gentoo/proc
+mount --rbind /sys /mnt/gentoo/sys
+mount --make-rslave /mnt/gentoo/sys
+mount --rbind /dev /mnt/gentoo/dev
+mount --make-rslave /mnt/gentoo/dev
+mount --bind /run /mnt/gentoo/run
+mount --make-slave /mnt/gentoo/run
+
+cat << 'CHROOT_BODY' > /mnt/gentoo/chroot_script.sh
+#!/bin/bash
+set -e
+source /etc/profile
+
+echo "Синхронизация репозитория..."
+emerge-webrsync -q
+
+echo "Europe/Moscow" > /etc/timezone
+emerge --config sys-libs/timezone-data
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo 'LANG="en_US.UTF-8"' > /etc/locale.conf
+env-update && source /etc/profile
+
+echo "gentoo-pc" > /etc/hostname
+
+BOOT_UUID=$(blkid -s UUID -o value /dev/sdb1)
+SWAP_UUID=$(blkid -s UUID -o value /dev/sdb2)
+ROOT_UUID=$(blkid -s UUID -o value /dev/sdb3)
+
+cat << FSTAB > /etc/fstab
+UUID=$BOOT_UUID	/efi	vfat	defaults,noatime	0 2
+UUID=$SWAP_UUID	none	swap	sw			0 0
+UUID=$ROOT_UUID	/	ext4	noatime			0 1
+FSTAB
+
+echo "Установка ядра и системы..."
+emerge --usepkg y sys-kernel/gentoo-kernel-bin sys-kernel/linux-firmware sys-boot/grub sys-apps/dbus sys-process/elogind net-misc/dhcpcd
+
+rc-update add dbus default
+rc-update add elogind default
+rc-update add dhcpcd default || true
+
+grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=Gentoo
+grub-mkconfig -o /boot/grub/grub.cfg
+
+echo "root:$ROOT_PASSWORD" | chpasswd
+CHROOT_BODY
+
+sed -i "s/\$ROOT_PASSWORD/$ROOT_PASSWORD/g" /mnt/gentoo/chroot_script.sh
+chmod +x /mnt/gentoo/chroot_script.sh
+chroot /mnt/gentoo /chroot_script.sh
+rm /mnt/gentoo/chroot_script.sh
+
+umount -l /mnt/gentoo/dev{/shm,/pts,}
+umount -R /mnt/gentoo
+echo "Gentoo успешно установлена!"
